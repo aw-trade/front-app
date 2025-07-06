@@ -312,7 +312,7 @@ def render_current_simulation():
                 from datetime import datetime
                 try:
                     start_time = datetime.fromisoformat(status["start_time"].replace('Z', '+00:00'))
-                    elapsed = (datetime.now() - start_time.replace(tzinfo=None)).total_seconds()
+                    elapsed = (datetime.now(start_time.tzinfo) - start_time).total_seconds()
                     duration = status.get("duration_seconds", 0)
                     
                     if duration > 0:
