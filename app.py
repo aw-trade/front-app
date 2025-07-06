@@ -1,457 +1,397 @@
 import streamlit as st
-import pandas as pd
-import numpy as np
-import plotly.graph_objects as go
-import plotly.express as px
-from datetime import datetime, timedelta
-import json
+from typing import Dict, Any
 import time
-import socket
-import threading
-from typing import Dict, List, Optional
-from dataclasses import dataclass
-import queue
+from config import Config
+from utils.api_client import get_api_client
 
-# Page configuration - MUST BE FIRST STREAMLIT COMMAND
 st.set_page_config(
-    page_title="Live Crypto Trading Dashboard",
-    page_icon="₿",
-    layout="wide",
-    initial_sidebar_state="expanded"
+    page_title="Trading Simulation Orchestrator",
+    page_icon="📈",
+    layout="wide"
 )
 
-@dataclass
-class MarketData:
-    """Market data structure matching the Rust service"""
-    symbol: str
-    price: float
-    volume: float
-    bid: float
-    ask: float
-    timestamp: int
-    exchange: str
-    
-    @classmethod
-    def from_dict(cls, data: dict) -> 'MarketData':
-        return cls(**data)
-    
-    def to_readable_time(self) -> str:
-        """Convert timestamp to readable format"""
-        return datetime.fromtimestamp(self.timestamp / 1000).strftime('%Y-%m-%d %H:%M:%S')
+def initialize_session_state():
+    """Initialize session state variables"""
+    if "simulation_runs" not in st.session_state:
+        st.session_state.simulation_runs = []
+    if "current_run_id" not in st.session_state:
+        st.session_state.current_run_id = None
 
-class CryptoStreamClient:
-    """Python client for the Rust crypto streaming service"""
+def render_algorithm_config(algorithm: str) -> Dict[str, Any]:
+    """Render algorithm-specific configuration form"""
+    st.subheader("Algorithm Configuration")
     
-    def __init__(self, server_host: str = "127.0.0.1", server_port: int = 8888):
-        self.server_address = (server_host, server_port)
-        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.socket.settimeout(1.0)
+    default_config = Config.DEFAULT_ALGO_CONFIG.get(algorithm, {})
+    config = {}
+    
+    if algorithm == "order-book-algo":
+        config["IMBALANCE_THRESHOLD"] = st.slider(
+            "Imbalance Threshold",
+            min_value=0.1,
+            max_value=1.0,
+            value=default_config.get("IMBALANCE_THRESHOLD", 0.6),
+            step=0.1,
+            help="Minimum order book imbalance required to trigger a signal"
+        )
         
-        self.subscribed_symbols: List[str] = []
-        self.is_running = False
-        self.receive_thread: Optional[threading.Thread] = None
+        config["MIN_VOLUME_THRESHOLD"] = st.number_input(
+            "Min Volume Threshold",
+            min_value=1.0,
+            max_value=1000.0,
+            value=default_config.get("MIN_VOLUME_THRESHOLD", 10.0),
+            help="Minimum volume required to consider a signal"
+        )
         
-        # Data queue for thread-safe communication with Streamlit
-        self.data_queue = queue.Queue()
+        config["LOOKBACK_PERIODS"] = st.number_input(
+            "Lookback Periods",
+            min_value=1,
+            max_value=50,
+            value=default_config.get("LOOKBACK_PERIODS", 5),
+            help="Number of periods to look back for signal calculation"
+        )
         
-    def subscribe(self, symbol: str) -> bool:
-        """Subscribe to a cryptocurrency symbol"""
-        try:
-            request = {
-                "action": "start",
-                "symbol": symbol.upper()
-            }
-            
-            message = json.dumps(request).encode('utf-8')
-            self.socket.sendto(message, self.server_address)
-            
-            if symbol.upper() not in self.subscribed_symbols:
-                self.subscribed_symbols.append(symbol.upper())
-            
-            return True
-            
-        except Exception as e:
-            print(f"Failed to subscribe to {symbol}: {e}")
-            return False
-    
-    def unsubscribe(self, symbol: str) -> bool:
-        """Unsubscribe from a cryptocurrency symbol"""
-        try:
-            request = {
-                "action": "stop",
-                "symbol": symbol.upper()
-            }
-            
-            message = json.dumps(request).encode('utf-8')
-            self.socket.sendto(message, self.server_address)
-            
-            if symbol.upper() in self.subscribed_symbols:
-                self.subscribed_symbols.remove(symbol.upper())
-            
-            return True
-            
-        except Exception as e:
-            print(f"Failed to unsubscribe from {symbol}: {e}")
-            return False
-    
-    def _receive_data(self):
-        """Background thread to receive market data"""
-        while self.is_running:
-            try:
-                data, addr = self.socket.recvfrom(4096)
-                json_data = json.loads(data.decode('utf-8'))
-                market_data = MarketData.from_dict(json_data)
-                
-                # Put data in queue for Streamlit to consume
-                self.data_queue.put(market_data)
-                    
-            except socket.timeout:
-                continue
-            except json.JSONDecodeError as e:
-                print(f"Failed to parse JSON: {e}")
-            except Exception as e:
-                print(f"Error receiving data: {e}")
-    
-    def start(self):
-        """Start receiving data"""
-        if self.is_running:
-            return
+        config["SIGNAL_COOLDOWN_MS"] = st.number_input(
+            "Signal Cooldown (ms)",
+            min_value=10,
+            max_value=10000,
+            value=default_config.get("SIGNAL_COOLDOWN_MS", 100),
+            help="Minimum time between signals in milliseconds"
+        )
         
-        self.is_running = True
-        self.receive_thread = threading.Thread(target=self._receive_data, daemon=True)
-        self.receive_thread.start()
-    
-    def stop(self):
-        """Stop receiving data"""
-        if not self.is_running:
-            return
+    elif algorithm == "rsi-algo":
+        config["RSI_PERIOD"] = st.number_input(
+            "RSI Period",
+            min_value=2,
+            max_value=50,
+            value=default_config.get("RSI_PERIOD", 14),
+            help="Period for RSI calculation"
+        )
         
-        self.is_running = False
+        config["RSI_OVERBOUGHT"] = st.slider(
+            "RSI Overbought Level",
+            min_value=50,
+            max_value=95,
+            value=default_config.get("RSI_OVERBOUGHT", 70),
+            help="RSI level considered overbought"
+        )
         
-        # Unsubscribe from all symbols
-        for symbol in self.subscribed_symbols.copy():
-            self.unsubscribe(symbol)
+        config["RSI_OVERSOLD"] = st.slider(
+            "RSI Oversold Level",
+            min_value=5,
+            max_value=50,
+            value=default_config.get("RSI_OVERSOLD", 30),
+            help="RSI level considered oversold"
+        )
         
-        if self.receive_thread:
-            self.receive_thread.join(timeout=2)
+        config["SIGNAL_COOLDOWN_MS"] = st.number_input(
+            "Signal Cooldown (ms)",
+            min_value=10,
+            max_value=10000,
+            value=default_config.get("SIGNAL_COOLDOWN_MS", 100),
+            help="Minimum time between signals in milliseconds"
+        )
     
-    def close(self):
-        """Close the client connection"""
-        self.stop()
-        self.socket.close()
+    return config
+
+def render_simulator_config() -> Dict[str, Any]:
+    """Render simulator configuration form"""
+    st.subheader("Simulator Configuration")
     
-    def get_latest_data(self) -> List[MarketData]:
-        """Get all available data from queue"""
-        data_list = []
-        try:
-            while True:
-                data_list.append(self.data_queue.get_nowait())
-        except queue.Empty:
-            pass
-        return data_list
-
-# Initialize session state
-if 'crypto_client' not in st.session_state:
-    st.session_state.crypto_client = None
-if 'market_data' not in st.session_state:
-    st.session_state.market_data = {}
-if 'price_history' not in st.session_state:
-    st.session_state.price_history = {}
-if 'is_streaming' not in st.session_state:
-    st.session_state.is_streaming = False
-
-def initialize_client(host: str = "127.0.0.1", port: int = 8888):
-    """Initialize the crypto client if not already done"""
-    if st.session_state.crypto_client is not None:
-        st.session_state.crypto_client.close()
+    default_config = Config.DEFAULT_SIMULATOR_CONFIG
+    config = {}
     
-    st.session_state.crypto_client = CryptoStreamClient(host, port)
-    st.session_state.crypto_client.start()
-
-def update_market_data():
-    """Update market data from the stream"""
-    if st.session_state.crypto_client:
-        new_data = st.session_state.crypto_client.get_latest_data()
-        
-        for data in new_data:
-            # Update current market data
-            st.session_state.market_data[data.symbol] = data
-            
-            # Update price history for charting
-            if data.symbol not in st.session_state.price_history:
-                st.session_state.price_history[data.symbol] = []
-            
-            # Keep last 100 price points
-            history = st.session_state.price_history[data.symbol]
-            history.append({
-                'timestamp': datetime.fromtimestamp(data.timestamp / 1000),
-                'price': data.price,
-                'volume': data.volume,
-                'bid': data.bid,
-                'ask': data.ask
-            })
-            
-            # Keep only last 100 points
-            if len(history) > 100:
-                history.pop(0)
-
-# Sidebar
-st.sidebar.title("₿ Live Crypto Dashboard")
-
-# Connection settings
-st.sidebar.subheader("🔧 Connection Settings")
-server_host = st.sidebar.text_input("Server Host", "127.0.0.1")
-server_port = st.sidebar.number_input("Server Port", value=8888, min_value=1, max_value=65535)
-
-# Connection button
-if st.sidebar.button("🔌 Connect"):
-    initialize_client(server_host, server_port)
-    st.sidebar.success("Connected to server")
-
-# Available cryptocurrencies
-available_cryptos = [
-    "BTC", "ETH", "ADA", "SOL", "MATIC", "DOT", "LINK", "UNI",
-    "AAVE", "SUSHI", "CRV", "COMP", "MKR", "YFI", "SNX", "BAL"
-]
-
-selected_crypto = st.sidebar.selectbox(
-    "🪙 Select Cryptocurrency",
-    available_cryptos,
-    index=0
-)
-
-# Stream control
-st.sidebar.subheader("📡 Stream Control")
-
-col1, col2 = st.sidebar.columns(2)
-
-with col1:
-    if st.button("🚀 Start Stream"):
-        if st.session_state.crypto_client is None:
-            initialize_client(server_host, server_port)
-        
-        if st.session_state.crypto_client and st.session_state.crypto_client.subscribe(selected_crypto):
-            st.session_state.is_streaming = True
-            st.sidebar.success(f"Started streaming {selected_crypto}")
-        else:
-            st.sidebar.error("Failed to start stream")
-
-with col2:
-    if st.button("🛑 Stop Stream"):
-        if st.session_state.crypto_client:
-            st.session_state.crypto_client.unsubscribe(selected_crypto)
-            if selected_crypto in st.session_state.market_data:
-                del st.session_state.market_data[selected_crypto]
-            if selected_crypto in st.session_state.price_history:
-                del st.session_state.price_history[selected_crypto]
-            st.sidebar.success(f"Stopped streaming {selected_crypto}")
-
-# Auto-refresh control
-auto_refresh = st.sidebar.checkbox("🔄 Auto Refresh", value=True)
-if auto_refresh:
-    refresh_rate = st.sidebar.slider("Refresh Rate (seconds)", 1, 10, 2)
-
-# Main content
-st.title("₿ Live Cryptocurrency Trading Dashboard")
-
-# Update data if streaming
-if st.session_state.is_streaming and st.session_state.crypto_client:
-    update_market_data()
-
-# Display current data
-if selected_crypto in st.session_state.market_data:
-    data = st.session_state.market_data[selected_crypto]
-    
-    # Current price display
-    col1, col2, col3, col4, col5 = st.columns(5)
+    col1, col2 = st.columns(2)
     
     with col1:
-        st.metric(
-            label=f"{selected_crypto} Price",
-            value=f"${data.price:.4f}",
-            delta=None
+        config["INITIAL_CAPITAL"] = st.number_input(
+            "Initial Capital ($)",
+            min_value=1000.0,
+            max_value=10000000.0,
+            value=default_config.get("INITIAL_CAPITAL", 100000.0),
+            help="Starting capital for the simulation"
+        )
+        
+        config["POSITION_SIZE_PCT"] = st.slider(
+            "Position Size (%)",
+            min_value=0.01,
+            max_value=1.0,
+            value=default_config.get("POSITION_SIZE_PCT", 0.05),
+            step=0.01,
+            help="Position size as percentage of portfolio"
+        )
+        
+        config["MAX_POSITION_SIZE"] = st.number_input(
+            "Max Position Size ($)",
+            min_value=100.0,
+            max_value=1000000.0,
+            value=default_config.get("MAX_POSITION_SIZE", 10000.0),
+            help="Maximum position size in dollars"
+        )
+        
+        config["TRADING_FEE_PCT"] = st.number_input(
+            "Trading Fee (%)",
+            min_value=0.0,
+            max_value=1.0,
+            value=default_config.get("TRADING_FEE_PCT", 0.001),
+            step=0.0001,
+            format="%.4f",
+            help="Trading fee as percentage of trade value"
         )
     
     with col2:
-        st.metric(
-            label="Volume",
-            value=f"{data.volume:.2f}",
-            delta=None
+        config["MIN_CONFIDENCE"] = st.slider(
+            "Min Confidence",
+            min_value=0.0,
+            max_value=1.0,
+            value=default_config.get("MIN_CONFIDENCE", 0.3),
+            step=0.1,
+            help="Minimum confidence required to execute trade"
         )
-    
-    with col3:
-        st.metric(
-            label="Bid",
-            value=f"${data.bid:.4f}",
-            delta=None
-        )
-    
-    with col4:
-        st.metric(
-            label="Ask",
-            value=f"${data.ask:.4f}",
-            delta=None
-        )
-    
-    with col5:
-        spread = data.ask - data.bid
-        spread_pct = (spread / data.price) * 100 if data.price > 0 else 0
-        st.metric(
-            label="Spread",
-            value=f"${spread:.4f}",
-            delta=f"{spread_pct:.3f}%"
-        )
-    
-    # Price chart
-    if selected_crypto in st.session_state.price_history and st.session_state.price_history[selected_crypto]:
-        st.subheader(f"📈 {selected_crypto} Live Price Chart")
         
-        history = st.session_state.price_history[selected_crypto]
-        df = pd.DataFrame(history)
+        config["ENABLE_SHORTING"] = st.checkbox(
+            "Enable Shorting",
+            value=default_config.get("ENABLE_SHORTING", True),
+            help="Allow short positions"
+        )
         
-        if len(df) > 0:
-            fig = go.Figure()
-            
-            # Price line
-            fig.add_trace(go.Scatter(
-                x=df['timestamp'],
-                y=df['price'],
-                mode='lines',
-                name='Price',
-                line=dict(color='#00D2FF', width=2),
-                fill='tonexty' if len(df) > 1 else None,
-                fillcolor='rgba(0, 210, 255, 0.1)'
-            ))
-            
-            # Bid/Ask spread
-            fig.add_trace(go.Scatter(
-                x=df['timestamp'],
-                y=df['bid'],
-                mode='lines',
-                name='Bid',
-                line=dict(color='green', width=1, dash='dot'),
-                opacity=0.7
-            ))
-            
-            fig.add_trace(go.Scatter(
-                x=df['timestamp'],
-                y=df['ask'],
-                mode='lines',
-                name='Ask',
-                line=dict(color='red', width=1, dash='dot'),
-                opacity=0.7
-            ))
-            
-            fig.update_layout(
-                title=f"{selected_crypto} Live Price Movement",
-                xaxis_title="Time",
-                yaxis_title="Price (USD)",
-                height=500,
-                showlegend=True,
-                hovermode='x unified',
-                plot_bgcolor='rgba(0,0,0,0)',
-                paper_bgcolor='rgba(0,0,0,0)',
-            )
-            
-            fig.update_xaxes(gridcolor='rgba(128,128,128,0.2)')
-            fig.update_yaxes(gridcolor='rgba(128,128,128,0.2)')
-            
-            st.plotly_chart(fig, use_container_width=True)
-            
-            # Volume chart
-            st.subheader(f"📊 {selected_crypto} Volume")
-            
-            fig_vol = go.Figure()
-            fig_vol.add_trace(go.Bar(
-                x=df['timestamp'],
-                y=df['volume'],
-                name='Volume',
-                marker_color='rgba(255, 193, 7, 0.7)'
-            ))
-            
-            fig_vol.update_layout(
-                title=f"{selected_crypto} Trading Volume",
-                xaxis_title="Time",
-                yaxis_title="Volume",
-                height=300,
-                plot_bgcolor='rgba(0,0,0,0)',
-                paper_bgcolor='rgba(0,0,0,0)',
-            )
-            
-            st.plotly_chart(fig_vol, use_container_width=True)
+        config["STATS_INTERVAL_SECS"] = st.number_input(
+            "Stats Interval (seconds)",
+            min_value=1,
+            max_value=300,
+            value=default_config.get("STATS_INTERVAL_SECS", 30),
+            help="Interval for collecting statistics"
+        )
     
-    # Market data table
-    st.subheader("📋 Detailed Market Data")
+    return config
+
+def render_simulation_form():
+    """Render the main simulation configuration form"""
+    st.title("🎯 Trading Simulation Orchestrator")
     
-    market_info = {
-        'Symbol': data.symbol,
-        'Price': f"${data.price:.4f}",
-        'Volume': f"{data.volume:.2f}",
-        'Bid': f"${data.bid:.4f}",
-        'Ask': f"${data.ask:.4f}",
-        'Exchange': data.exchange,
-        'Last Update': data.to_readable_time()
-    }
+    # API Health Check
+    api_client = get_api_client()
     
-    df_info = pd.DataFrame([market_info])
-    st.dataframe(df_info, use_container_width=True, hide_index=True)
-
-else:
-    # No data available
-    st.info(f"No live data available for {selected_crypto}. Click 'Start Stream' to begin receiving data.")
+    try:
+        health = api_client.health_check()
+        st.success("✅ API Connection Healthy")
+    except Exception as e:
+        st.error(f"❌ API Connection Failed: {str(e)}")
+        st.stop()
     
-    # Show connection status
-    st.subheader("🔌 Connection Status")
+    st.header("Start New Simulation")
     
-    if st.session_state.crypto_client is None:
-        st.error("❌ Not connected to crypto stream server")
-        st.info("Click 'Connect' then 'Start Stream' to begin receiving live data.")
-    elif st.session_state.is_streaming:
-        st.success("✅ Connected and streaming data")
-    else:
-        st.warning("⚠️ Connected but not streaming. Select a cryptocurrency and start streaming.")
-
-# Multi-symbol dashboard
-st.subheader("📊 Multi-Symbol Dashboard")
-
-if st.session_state.market_data:
-    # Create summary table of all active symbols
-    summary_data = []
-    for symbol, data in st.session_state.market_data.items():
-        summary_data.append({
-            'Symbol': symbol,
-            'Price': f"${data.price:.4f}",
-            'Volume': f"{data.volume:.2f}",
-            'Bid': f"${data.bid:.4f}",
-            'Ask': f"${data.ask:.4f}",
-            'Spread': f"${data.ask - data.bid:.4f}",
-            'Exchange': data.exchange,
-            'Last Update': data.to_readable_time()
-        })
+    # Basic Configuration
+    col1, col2 = st.columns(2)
     
-    if summary_data:
-        df_summary = pd.DataFrame(summary_data)
-        st.dataframe(df_summary, use_container_width=True, hide_index=True)
-else:
-    st.info("No active streams. Start streaming some cryptocurrencies to see data here.")
+    with col1:
+        algorithm = st.selectbox(
+            "Algorithm",
+            Config.ALGORITHMS,
+            help="Select the trading algorithm to use"
+        )
+    
+    with col2:
+        duration_seconds = st.number_input(
+            "Duration (seconds)",
+            min_value=30,
+            max_value=3600,
+            value=Config.DEFAULT_DURATION_SECONDS,
+            help="How long to run the simulation"
+        )
+    
+    # Algorithm-specific configuration
+    algo_config = render_algorithm_config(algorithm)
+    
+    # Simulator configuration
+    simulator_config = render_simulator_config()
+    
+    # Start simulation button
+    if st.button("🚀 Start Simulation", type="primary"):
+        with st.spinner("Starting simulation..."):
+            try:
+                result = api_client.start_simulation(
+                    duration_seconds=duration_seconds,
+                    algorithm=algorithm,
+                    algo_consts=algo_config,
+                    simulator_consts=simulator_config
+                )
+                
+                run_id = result.get("run_id")
+                st.session_state.current_run_id = run_id
+                st.session_state.simulation_runs.append({
+                    "run_id": run_id,
+                    "algorithm": algorithm,
+                    "duration": duration_seconds,
+                    "started_at": time.time()
+                })
+                
+                st.success(f"✅ Simulation started successfully!")
+                st.info(f"Run ID: `{run_id}`")
+                
+            except Exception as e:
+                st.error(f"❌ Failed to start simulation: {str(e)}")
 
-# Footer
-st.markdown("---")
-col1, col2, col3 = st.columns(3)
+def render_current_simulation():
+    """Render current simulation status"""
+    if not st.session_state.current_run_id:
+        return
+    
+    st.header("Current Simulation Status")
+    
+    run_id = st.session_state.current_run_id
+    
+    # Import database client
+    from utils.db_client import get_simulation_by_id_sync
+    
+    col1, col2 = st.columns([3, 1])
+    
+    with col1:
+        st.code(f"Run ID: {run_id}")
+    
+    with col2:
+        if st.button("🔄 Refresh Status"):
+            pass  # Will trigger rerun
+    
+    try:
+        # Get simulation status directly from database
+        status = get_simulation_by_id_sync(run_id)
+        
+        if not status:
+            st.error(f"❌ Simulation {run_id} not found in database")
+            return
+        
+        # Display basic status
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            st.metric("Status", status.get("status", "Unknown"))
+        
+        with col2:
+            st.metric("Algorithm", status.get("algorithm_version", "Unknown"))
+            
+        with col3:
+            duration = status.get("duration_seconds", 0)
+            st.metric("Duration", f"{duration}s")
+        
+        # Show performance metrics if available
+        if status.get("net_pnl") is not None:
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Net P&L", f"${status['net_pnl']:.2f}")
+            with col2:
+                if status.get("return_pct") is not None:
+                    st.metric("Return", f"{status['return_pct']:.2f}%")
+            with col3:
+                if status.get("total_trades") is not None:
+                    st.metric("Total Trades", status['total_trades'])
+        
+        # Show status-specific information    
+        if status.get("status") == "completed":
+            st.success("🎉 Simulation completed successfully!")
+            
+            # Show detailed results
+            if status.get("win_rate") is not None:
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.metric("Win Rate", f"{status['win_rate']:.2f}%")
+                with col2:
+                    if status.get("max_drawdown") is not None:
+                        st.metric("Max Drawdown", f"{status['max_drawdown']:.2f}%")
+            
+            if st.button("📊 View Results"):
+                st.info("Results viewing will be implemented in the next feature!")
+        
+        elif status.get("status") == "failed":
+            st.error(f"❌ Simulation failed")
+            
+        elif status.get("status") == "running":
+            st.info("⏳ Simulation is currently running...")
+            
+            # Show progress information if available
+            if status.get("start_time"):
+                from datetime import datetime
+                try:
+                    start_time = datetime.fromisoformat(status["start_time"].replace('Z', '+00:00'))
+                    elapsed = (datetime.now() - start_time.replace(tzinfo=None)).total_seconds()
+                    duration = status.get("duration_seconds", 0)
+                    
+                    if duration > 0:
+                        progress = min(elapsed / duration, 1.0)
+                        st.progress(progress)
+                        st.text(f"Elapsed: {elapsed:.0f}s / {duration}s")
+                except:
+                    pass
+            
+    except Exception as e:
+        st.error(f"❌ Failed to get simulation status: {str(e)}")
 
-with col1:
-    if st.session_state.is_streaming:
-        st.success("🟢 Streaming Active")
-    else:
-        st.error("🔴 Streaming Inactive")
+def render_recent_simulations():
+    """Render recent simulations list"""
+    st.header("Recent Simulations")
+    
+    # Import database client
+    from utils.db_client import get_recent_simulations_sync, check_db_health_sync
+    
+    try:
+        # Check database health first
+        if not check_db_health_sync():
+            st.error("❌ Database connection failed")
+            return
+        
+        # Get recent simulations directly from database
+        runs = get_recent_simulations_sync(limit=10)
+        
+        if not runs:
+            st.info("No recent simulations found.")
+            return
+            
+        for run in runs:
+            with st.expander(f"Run {run['run_id']} - {run['status']}"):
+                col1, col2, col3 = st.columns(3)
+                
+                with col1:
+                    st.text(f"Algorithm: {run.get('algorithm_version', 'Unknown')}")
+                    st.text(f"Status: {run.get('status', 'Unknown')}")
+                
+                with col2:
+                    st.text(f"Duration: {run.get('duration_seconds', 0)}s")
+                    if run.get('start_time'):
+                        st.text(f"Started: {run['start_time'][:19]}")  # Show date/time without microseconds
+                    else:
+                        st.text("Started: Unknown")
+                
+                with col3:
+                    # Show performance metrics if available
+                    if run.get('net_pnl') is not None:
+                        st.text(f"Net P&L: ${run['net_pnl']:.2f}")
+                    if run.get('return_pct') is not None:
+                        st.text(f"Return: {run['return_pct']:.2f}%")
+                    if run.get('total_trades') is not None:
+                        st.text(f"Trades: {run['total_trades']}")
+                    
+                    if st.button(f"View Details", key=f"view_{run['run_id']}"):
+                        st.session_state.current_run_id = run['run_id']
+                        st.rerun()
+                        
+    except Exception as e:
+        st.error(f"❌ Failed to get recent simulations: {str(e)}")
 
-with col2:
-    st.info(f"📡 Active Streams: {len(st.session_state.market_data)}")
+def main():
+    """Main application function"""
+    initialize_session_state()
+    
+    # Render main components
+    render_simulation_form()
+    
+    st.divider()
+    
+    # Show current simulation if exists
+    if st.session_state.current_run_id:
+        render_current_simulation()
+        st.divider()
+    
+    # Show recent simulations
+    render_recent_simulations()
 
-with col3:
-    st.info(f"🕐 Last Update: {datetime.now().strftime('%H:%M:%S')}")
-
-# Auto refresh
-if auto_refresh and st.session_state.is_streaming:
-    time.sleep(refresh_rate)
-    st.rerun()
+if __name__ == "__main__":
+    main()
