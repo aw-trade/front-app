@@ -241,7 +241,7 @@ def render_current_simulation():
     run_id = st.session_state.current_run_id
     
     # Import database client
-    from utils.db_client import get_simulation_by_id_sync
+    from utils.db_client import get_simulation_by_id
     
     col1, col2 = st.columns([3, 1])
     
@@ -254,7 +254,7 @@ def render_current_simulation():
     
     try:
         # Get simulation status directly from database
-        status = get_simulation_by_id_sync(run_id)
+        status = get_simulation_by_id(run_id)
         
         if not status:
             st.error(f"❌ Simulation {run_id} not found in database")
@@ -330,16 +330,16 @@ def render_recent_simulations():
     st.header("Recent Simulations")
     
     # Import database client
-    from utils.db_client import get_recent_simulations_sync, check_db_health_sync
+    from utils.db_client import get_recent_simulations, check_db_health
     
     try:
         # Check database health first
-        if not check_db_health_sync():
+        if not check_db_health():
             st.error("❌ Database connection failed")
             return
         
         # Get recent simulations directly from database
-        runs = get_recent_simulations_sync(limit=10)
+        runs = get_recent_simulations(limit=10)
         
         if not runs:
             st.info("No recent simulations found.")

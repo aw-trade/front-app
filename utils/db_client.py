@@ -1,9 +1,10 @@
-import asyncpg
-import asyncio
+import psycopg2
+import psycopg2.pool
 import os
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 import logging
+import threading
 
 logger = logging.getLogger(__name__)
 
@@ -17,56 +18,69 @@ class DatabaseClient:
         self.password = os.getenv("POSTGRES_PASSWORD", "trading_pass")
         
         self.connection_pool = None
+        self._lock = threading.Lock()
     
-    async def connect(self):
+    def connect(self):
         """Initialize connection pool"""
-        try:
-            self.connection_pool = await asyncpg.create_pool(
-                host=self.host,
-                port=self.port,
-                database=self.database,
-                user=self.user,
-                password=self.password,
-                min_size=1,
-                max_size=5,
-                command_timeout=60
-            )
-            logger.info(f"Connected to PostgreSQL at {self.host}:{self.port}")
-        except Exception as e:
-            logger.error(f"Failed to connect to PostgreSQL: {e}")
-            raise
+        with self._lock:
+            if self.connection_pool is not None:
+                return
+                
+            try:
+                self.connection_pool = psycopg2.pool.ThreadedConnectionPool(
+                    minconn=1,
+                    maxconn=5,
+                    host=self.host,
+                    port=self.port,
+                    database=self.database,
+                    user=self.user,
+                    password=self.password,
+                    connect_timeout=10
+                )
+                logger.info(f"Connected to PostgreSQL at {self.host}:{self.port}")
+            except Exception as e:
+                logger.error(f"Failed to connect to PostgreSQL: {e}")
+                raise
     
-    async def disconnect(self):
+    def disconnect(self):
         """Close connection pool"""
-        if self.connection_pool:
-            await self.connection_pool.close()
-            self.connection_pool = None
-            logger.info("Disconnected from PostgreSQL")
+        with self._lock:
+            if self.connection_pool:
+                self.connection_pool.closeall()
+                self.connection_pool = None
+                logger.info("Disconnected from PostgreSQL")
     
-    async def is_connected(self) -> bool:
+    def is_connected(self) -> bool:
         """Check if connection pool is active and healthy"""
         if not self.connection_pool:
             return False
         try:
-            async with self.connection_pool.acquire() as conn:
-                await conn.execute("SELECT 1")
+            conn = self.connection_pool.getconn()
+            if conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT 1")
+                    conn.commit()
+                self.connection_pool.putconn(conn)
                 return True
-        except Exception:
+        except Exception as e:
+            logger.error(f"Connection health check failed: {e}")
             return False
     
-    async def ensure_connected(self):
+    def ensure_connected(self):
         """Ensure connection pool is active, reconnect if needed"""
-        if not await self.is_connected():
+        if not self.is_connected():
             logger.info("Reconnecting to database...")
-            await self.disconnect()  # Clean up any stale connections
-            await self.connect()
+            self.disconnect()  # Clean up any stale connections
+            self.connect()
     
-    async def get_recent_simulations(self, limit: int = 10) -> List[Dict[str, Any]]:
+    def get_recent_simulations(self, limit: int = 10) -> List[Dict[str, Any]]:
         """Get recent simulation runs from database"""
-        await self.ensure_connected()
+        self.ensure_connected()
         
+        conn = None
         try:
-            async with self.connection_pool.acquire() as conn:
+            conn = self.connection_pool.getconn()
+            with conn.cursor() as cur:
                 query = """
                     SELECT 
                         run_id,
@@ -87,15 +101,19 @@ class DatabaseClient:
                         updated_at
                     FROM simulation_runs 
                     ORDER BY start_time DESC 
-                    LIMIT $1
+                    LIMIT %s
                 """
                 
-                rows = await conn.fetch(query, limit)
+                cur.execute(query, (limit,))
+                rows = cur.fetchall()
+                
+                # Get column names
+                columns = [desc[0] for desc in cur.description]
                 
                 # Convert rows to dictionaries
                 simulations = []
                 for row in rows:
-                    sim = dict(row)
+                    sim = dict(zip(columns, row))
                     # Convert datetime objects to ISO strings for JSON serialization
                     for key, value in sim.items():
                         if isinstance(value, datetime):
@@ -107,13 +125,18 @@ class DatabaseClient:
         except Exception as e:
             logger.error(f"Failed to get recent simulations: {e}")
             raise
+        finally:
+            if conn:
+                self.connection_pool.putconn(conn)
     
-    async def get_simulation_by_id(self, run_id: str) -> Optional[Dict[str, Any]]:
+    def get_simulation_by_id(self, run_id: str) -> Optional[Dict[str, Any]]:
         """Get a specific simulation by run_id"""
-        await self.ensure_connected()
+        self.ensure_connected()
         
+        conn = None
         try:
-            async with self.connection_pool.acquire() as conn:
+            conn = self.connection_pool.getconn()
+            with conn.cursor() as cur:
                 query = """
                     SELECT 
                         run_id,
@@ -136,13 +159,17 @@ class DatabaseClient:
                         created_at,
                         updated_at
                     FROM simulation_runs 
-                    WHERE run_id = $1
+                    WHERE run_id = %s
                 """
                 
-                row = await conn.fetchrow(query, run_id)
+                cur.execute(query, (run_id,))
+                row = cur.fetchone()
                 
                 if row:
-                    sim = dict(row)
+                    # Get column names
+                    columns = [desc[0] for desc in cur.description]
+                    sim = dict(zip(columns, row))
+                    
                     # Convert datetime objects to ISO strings
                     for key, value in sim.items():
                         if isinstance(value, datetime):
@@ -154,15 +181,23 @@ class DatabaseClient:
         except Exception as e:
             logger.error(f"Failed to get simulation {run_id}: {e}")
             raise
+        finally:
+            if conn:
+                self.connection_pool.putconn(conn)
     
-    async def health_check(self) -> bool:
+    def health_check(self) -> bool:
         """Check database connection health"""
         try:
-            await self.ensure_connected()
+            self.ensure_connected()
             
-            async with self.connection_pool.acquire() as conn:
-                await conn.execute("SELECT 1")
+            conn = self.connection_pool.getconn()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT 1")
+                    conn.commit()
                 return True
+            finally:
+                self.connection_pool.putconn(conn)
                 
         except Exception as e:
             logger.error(f"Database health check failed: {e}")
@@ -170,139 +205,74 @@ class DatabaseClient:
 
 # Global client instance
 _db_client = None
+_client_lock = threading.Lock()
 
-async def get_db_client() -> DatabaseClient:
+def get_db_client() -> DatabaseClient:
     """Get or create database client instance"""
     global _db_client
-    if _db_client is None:
-        _db_client = DatabaseClient()
-        await _db_client.connect()
-    return _db_client
+    with _client_lock:
+        if _db_client is None:
+            _db_client = DatabaseClient()
+            _db_client.connect()
+        return _db_client
 
-# Streamlit session-based connection management
-def get_streamlit_db_client() -> DatabaseClient:
-    """Get or create Streamlit session-based database client with proper caching"""
-    try:
-        import streamlit as st
-        
-        # Use Streamlit's cache_resource to manage the connection pool
-        @st.cache_resource
-        def create_db_client():
-            """Create and cache database client for Streamlit session"""
-            client = DatabaseClient()
-            # Initialize connection synchronously for Streamlit
-            run_async(client.connect())
-            return client
-        
-        return create_db_client()
-    except ImportError:
-        # Fallback for non-Streamlit environments
-        return run_async(get_db_client())
-        
-async def cleanup_db_client():
+def cleanup_db_client():
     """Clean up database client and close connections"""
     global _db_client
-    if _db_client and _db_client.connection_pool:
-        await _db_client.disconnect()
-        _db_client = None
+    with _client_lock:
+        if _db_client and _db_client.connection_pool:
+            _db_client.disconnect()
+            _db_client = None
 
-def run_async(coro):
-    """Helper function to run async functions in sync context with proper event loop management"""
-    import concurrent.futures
-    
+def get_recent_simulations(limit: int = 10) -> List[Dict[str, Any]]:
+    """Get recent simulation runs from database with error recovery"""
     try:
-        # Check if we're already in an async context
-        try:
-            asyncio.get_running_loop()
-            # We're in an async context, need to run in a separate thread
-            def run_in_thread():
-                # Create a new event loop in this thread
-                new_loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(new_loop)
-                try:
-                    return new_loop.run_until_complete(coro)
-                finally:
-                    new_loop.close()
-            
-            with concurrent.futures.ThreadPoolExecutor() as executor:
-                future = executor.submit(run_in_thread)
-                return future.result(timeout=30)  # Add timeout to prevent hanging
-                
-        except RuntimeError:
-            # No event loop running, we can run directly
-            return asyncio.run(coro)
-            
-    except Exception as e:
-        logger.error(f"Error in run_async: {e}")
-        raise
-
-def get_recent_simulations_sync(limit: int = 10) -> List[Dict[str, Any]]:
-    """Synchronous wrapper for getting recent simulations with error recovery"""
-    def _get_simulations():
-        client = get_streamlit_db_client()
-        
-        async def _async_get():
-            await client.ensure_connected()
-            return await client.get_recent_simulations(limit)
-        
-        return run_async(_async_get())
-    
-    try:
-        return _get_simulations()
+        client = get_db_client()
+        return client.get_recent_simulations(limit)
     except Exception as e:
         logger.error(f"Failed to get recent simulations: {e}")
         # Try one more time with a fresh connection
         try:
-            run_async(cleanup_db_client())
-            return _get_simulations()
+            cleanup_db_client()
+            client = get_db_client()
+            return client.get_recent_simulations(limit)
         except Exception as retry_e:
             logger.error(f"Retry failed: {retry_e}")
             raise
 
-def get_simulation_by_id_sync(run_id: str) -> Optional[Dict[str, Any]]:
-    """Synchronous wrapper for getting simulation by ID with error recovery"""
-    def _get_simulation():
-        client = get_streamlit_db_client()
-        
-        async def _async_get():
-            await client.ensure_connected()
-            return await client.get_simulation_by_id(run_id)
-        
-        return run_async(_async_get())
-    
+def get_simulation_by_id(run_id: str) -> Optional[Dict[str, Any]]:
+    """Get a specific simulation by run_id with error recovery"""
     try:
-        return _get_simulation()
+        client = get_db_client()
+        return client.get_simulation_by_id(run_id)
     except Exception as e:
         logger.error(f"Failed to get simulation {run_id}: {e}")
         # Try one more time with a fresh connection
         try:
-            run_async(cleanup_db_client())
-            return _get_simulation()
+            cleanup_db_client()
+            client = get_db_client()
+            return client.get_simulation_by_id(run_id)
         except Exception as retry_e:
             logger.error(f"Retry failed: {retry_e}")
             raise
 
-def check_db_health_sync() -> bool:
-    """Synchronous wrapper for database health check with error recovery"""
-    def _health_check():
-        client = get_streamlit_db_client()
-        
-        async def _async_check():
-            await client.ensure_connected()
-            return await client.health_check()
-        
-        return run_async(_async_check())
-    
+def check_db_health() -> bool:
+    """Check database connection health with error recovery"""
     try:
-        return _health_check()
+        client = get_db_client()
+        return client.health_check()
     except Exception as e:
         logger.error(f"Database health check failed: {e}")
         # Try one more time with a fresh connection
         try:
-            run_async(cleanup_db_client())
-            return _health_check()
+            cleanup_db_client()
+            client = get_db_client()
+            return client.health_check()
         except Exception as retry_e:
             logger.error(f"Health check retry failed: {retry_e}")
             return False
 
-
+# Keep legacy function names for backward compatibility
+get_recent_simulations_sync = get_recent_simulations
+get_simulation_by_id_sync = get_simulation_by_id
+check_db_health_sync = check_db_health
